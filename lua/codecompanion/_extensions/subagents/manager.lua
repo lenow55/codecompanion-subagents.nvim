@@ -417,9 +417,16 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
 
   -- Hide parent chat UI (blocking mode only: the parent chat sits idle while
   -- the subagent works. In async mode the main agent keeps working, so the
-  -- parent chat must stay as it is)
-  if parent_chat and parent_chat.ui and not subagent_config.async then
-    parent_chat.ui:hide()
+  -- parent chat must stay as it is). The core UI can hold a stale winnr once
+  -- the window is closed, so only hide a visible window and pcall as defense
+  -- in depth.
+  if
+    parent_chat
+    and parent_chat.ui
+    and not subagent_config.async
+    and (not parent_chat.ui.is_visible or parent_chat.ui:is_visible())
+  then
+    pcall(parent_chat.ui.hide, parent_chat.ui)
   end
 
   -- Get filtered tools
@@ -495,10 +502,10 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
   if not ok then
     log:error("Failed to create subagent chat: %s", subagent_chat)
     -- Restore parent chat UI on error (blocking mode hid it; async mode only
-    -- if the chat is idle, otherwise we would interrupt the main agent)
+    -- if the chat is idle, otherwise we would interrupt the main agent).
     if parent_chat and parent_chat.ui then
       if not subagent_config.async or chat_is_idle(parent_chat) then
-        parent_chat.ui:open()
+        pcall(parent_chat.ui.open, parent_chat.ui)
       end
     end
     if state.completion_callback then
@@ -603,20 +610,29 @@ function M:complete_subagent(parent_chat, subagent_id, result, is_error)
   -- Store result
   state.pending_result = result
 
-  -- Save bufnr and clean up approval cache before clearing state
+  -- Save bufnr and clean up approval cache before clearing state.
+  -- The core UI keeps the winnr after the window is closed (it has no
+  -- WinClosed autocmd), so hide() can raise "Invalid window id" for a
+  -- subagent chat whose window the user closed. Only hide a visible window;
+  -- the call is pcall-guarded as defense in depth.
   local sub_bufnr = state.subagent_chat.bufnr
-  state.subagent_chat.ui:hide()
+  local sub_ui = state.subagent_chat.ui
+  if sub_ui and sub_ui.is_visible and sub_ui:is_visible() then
+    pcall(sub_ui.hide, sub_ui)
+  end
   if sub_bufnr then
     Approvals:reset(sub_bufnr)
   end
   state.subagent_chat = nil
 
   -- Restore parent chat UI (blocking mode hid it; async mode only when the
-  -- chat is idle and no other subagents are still running)
+  -- chat is idle and no other subagents are still running). open() is safe
+  -- on an invisible window (it creates a new one); pcall guards the
+  -- edge case of a stale winnr.
   if parent_chat and parent_chat.ui then
     local async = state.config and state.config.async == true
     if not async or (chat_is_idle(parent_chat) and not self:is_active(parent_chat)) then
-      parent_chat.ui:open()
+      pcall(parent_chat.ui.open, parent_chat.ui)
     end
   end
 

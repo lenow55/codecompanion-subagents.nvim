@@ -534,4 +534,80 @@ T["async_delivery"]["integration"]["ChatDone from another chat does not deliver 
   )
 end
 
+T["async_delivery"]["stale windows"] = new_set()
+
+T["async_delivery"]["stale windows"]["completion does not error when the subagent window was closed"] = function()
+  child.lua([[
+    local manager = require("codecompanion._extensions.subagents.manager")
+    local parent = _G.make_async_parent()
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("stale_agent", {
+      description = "stale", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    local id, st = next(parent._subagents)
+    -- The user closed the subagent chat window. The core UI keeps the stale
+    -- winnr and hide() raises E472 on it.
+    st.subagent_chat = {
+      bufnr = 9000,
+      ui = {
+        is_visible = function(self) return false end,
+        hide = function(self) error("Invalid window id: 1015", 0) end,
+        open = function() end,
+      },
+    }
+
+    local ok, err = pcall(function()
+      manager:complete_subagent(parent, id, "STALE-RESULT", false)
+    end)
+    _G.no_error = ok
+    _G.err = tostring(err)
+    _G.msg0 = parent.messages[1] and parent.messages[1].content
+  ]])
+  h.eq(
+    true,
+    child.lua_get([[_G.no_error]]),
+    "completion must not error on a closed subagent window (err: "
+      .. tostring(child.lua_get([[_G.err]]))
+      .. ")"
+  )
+  h.eq(
+    true,
+    child.lua_get([[_G.msg0 and _G.msg0:find("STALE-RESULT", 1, true) ~= nil]]),
+    "the result must still be delivered"
+  )
+end
+
+T["async_delivery"]["stale windows"]["blocking dispatch does not error when the parent window was closed"] = function()
+  child.lua([[
+    local parent = _G.make_async_parent()
+    parent.ui = {
+      is_visible = function(self) return false end,
+      hide = function(self) error("Invalid window id: 1016", 0) end,
+      open = function() end,
+    }
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("stale_blk_agent", {
+      description = "stale blk", system_prompt = "p", tools = {},
+    }, { async_delivery = false })
+
+    local ok, err = pcall(function()
+      t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    end)
+    _G.no_error = ok
+    _G.err = tostring(err)
+    _G.started = parent._subagents and next(parent._subagents) ~= nil
+  ]])
+  h.eq(
+    true,
+    child.lua_get([[_G.no_error]]),
+    "blocking dispatch must not error on a closed parent window (err: "
+      .. tostring(child.lua_get([[_G.err]]))
+      .. ")"
+  )
+  h.eq(true, child.lua_get([[_G.started]]), "the subagent must still start")
+end
+
 return T
