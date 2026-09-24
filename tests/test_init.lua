@@ -237,7 +237,10 @@ T["init"]["default_power validation"]["rejects default_power with explicit adapt
   ]])
 
   h.eq(false, child.lua_get([[_G.setup_ok]]))
-  h.eq(true, child.lua_get([[_G.error_msg:find("cannot set both adapter and default_power") ~= nil]]))
+  h.eq(
+    true,
+    child.lua_get([[_G.error_msg:find("cannot set both adapter and default_power") ~= nil]])
+  )
 end
 
 T["init"]["default_power validation"]["rejects default_power with inherit context_mode"] = function()

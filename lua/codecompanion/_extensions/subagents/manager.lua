@@ -8,9 +8,15 @@ local M = {}
 M._subagent_names = {}
 M._powers = {}
 
+local api = vim.api
+
+-- Results awaiting delivery in async_delivery mode.
+-- [parent_chat_id] = { { subagent_id = string, name = string, result = string, is_error = boolean|nil }, ... }
+local pending_results = {}
+
+local Approvals = require("codecompanion.interactions.chat.tools.approvals")
 local config = require("codecompanion.config")
 local log = require("codecompanion.utils.log")
-local Approvals = require("codecompanion.interactions.chat.tools.approvals")
 
 ---SubAgent base prompt - always injected to clarify execution context
 ---@type string
@@ -18,6 +24,116 @@ local SUBAGENT_BASE_PROMPT =
   [[You are running as a SubAgent. You should execute the task assigned to you by the main agent, but not the other tasks.
 You have access to the `complete_subagent` tool. When you have completed your task, you MUST call the `complete_subagent` tool to return your results to the main agent.
 DO NOT output your results directly in the response. ALL results MUST be passed as a parameter to the `complete_subagent` tool.]]
+
+---Whether a parent chat is free to be woken up for a delivery
+---@param chat CodeCompanion.Chat
+---@return boolean
+local function chat_is_idle(chat)
+  if not chat or not chat.bufnr or not api.nvim_buf_is_valid(chat.bufnr) then
+    return false
+  end
+  if chat.current_request ~= nil then
+    return false
+  end
+  if chat._compacting then
+    return false
+  end
+  -- A live tool orchestrator (even with an empty queue) will auto-submit the
+  -- chat right after the current batch ends, so delivering now would race it
+  if chat.tool_orchestrator ~= nil then
+    return false
+  end
+  return true
+end
+
+---Deliver the next pending result to an idle parent chat
+---@param chat CodeCompanion.Chat
+---@return nil
+local function deliver_next(chat)
+  if not chat_is_idle(chat) then
+    return
+  end
+  local queue = pending_results[chat.id]
+  local item = queue and queue[1] or nil
+  if not item then
+    return
+  end
+  table.remove(queue, 1)
+  if not next(queue) then
+    pending_results[chat.id] = nil
+  end
+
+  chat:add_buf_message({
+    role = config.constants.USER_ROLE,
+    content = string.format("[subagent_result id=%s]", item.subagent_id),
+  })
+  chat:add_message({
+    role = config.constants.USER_ROLE,
+    content = string.format("[subagent_result id=%s]\n%s", item.subagent_id, item.result),
+  })
+  chat:submit({ auto_submit = true })
+
+  log:info("Delivered subagent result for %s to parent chat", item.subagent_id)
+end
+
+---Enqueue a completed subagent result and deliver it on the parent chat's next idle point
+---@param chat CodeCompanion.Chat
+---@param subagent_id string
+---@param name string
+---@param result string
+---@param is_error boolean|nil
+local function request_delivery(chat, subagent_id, name, result, is_error)
+  if not chat or not chat.bufnr or not api.nvim_buf_is_valid(chat.bufnr) then
+    log:warn("Parent chat buffer is gone, dropping subagent result for %s", subagent_id)
+    return
+  end
+
+  local queue = pending_results[chat.id]
+  if not queue then
+    queue = {}
+    pending_results[chat.id] = queue
+  end
+  table.insert(queue, {
+    subagent_id = subagent_id,
+    name = name,
+    result = result,
+    is_error = is_error,
+  })
+
+  -- Deliver on the parent chat's next idle point. The event fires when a chat
+  -- turn finishes and the buffer is ready for input, which is the only safe
+  -- moment to inject a message and (re)submit the chat.
+  if not chat._subagents_delivery_listened then
+    chat._subagents_delivery_listened = true
+    api.nvim_create_autocmd("User", {
+      pattern = "CodeCompanionChatDone",
+      callback = function(ev)
+        if not ev.data or ev.data.bufnr ~= chat.bufnr then
+          return
+        end
+        vim.schedule(function()
+          if not api.nvim_buf_is_valid(chat.bufnr) then
+            return
+          end
+          -- Make sure the chat object is still the registered one for this buffer
+          local Chat = require("codecompanion.interactions.chat")
+          local current = Chat.buf_get_chat(chat.bufnr)
+          if current ~= chat then
+            return
+          end
+          deliver_next(current)
+        end)
+      end,
+    })
+  end
+
+  if chat_is_idle(chat) then
+    -- No LLM turn and no pending tool batch: deliver right away
+    deliver_next(chat)
+  else
+    log:info("Queued subagent result for %s (parent chat busy)", subagent_id)
+  end
+end
 
 ---Get or create subagent state for a chat
 ---@param chat CodeCompanion.Chat
@@ -106,7 +222,7 @@ function M:get_inherited_tools(parent_chat)
   local tools = {}
 
   for tool_name, _ in pairs(in_use) do
-    -- 排除 subagent 工具（避免递归）
+    -- Exclude subagent tools to prevent recursion
     if not tool_name:match("^subagent_") then
       table.insert(tools, tool_name)
     end
@@ -178,7 +294,8 @@ function M:get_inherited_messages(parent_chat, subagent_name, task)
     error("Precondition violated: tool call message not found in parent chat")
   end
 
-  local filtered_messages = vim.iter(messages)
+  local filtered_messages = vim
+    .iter(messages)
     :take(fork_msg_idx - 1)
     :filter(function(msg)
       return msg.role ~= "system"
@@ -253,7 +370,8 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
   -- Power resolution: call arg power > default_power > parent chat adapter
   local power = subagent_config.power
   local default_power = subagent_config.default_power
-  local supports_power = subagent_config.adapter == nil and subagent_config.context_mode ~= "inherit"
+  local supports_power = subagent_config.adapter == nil
+    and subagent_config.context_mode ~= "inherit"
 
   if power ~= nil then
     if not supports_power then
@@ -276,8 +394,10 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
     adapter = parent_chat.adapter
   end
 
-  -- Hide parent chat UI
-  if parent_chat and parent_chat.ui then
+  -- Hide parent chat UI (blocking mode only: the parent chat sits idle while
+  -- the subagent works. In async mode the main agent keeps working, so the
+  -- parent chat must stay as it is)
+  if parent_chat and parent_chat.ui and not subagent_config.async then
     parent_chat.ui:hide()
   end
 
@@ -322,8 +442,11 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
     -- Find the last user message and append result_spec
     for i = #messages, 1, -1 do
       if messages[i].role == config.constants.USER_ROLE then
-        messages[i].content =
-          string.format("%s\n\nUse @{complete_subagent} to response you result:\n<expected-result>\n%s\n</expected-result>", messages[i].content, result_spec)
+        messages[i].content = string.format(
+          "%s\n\nUse @{complete_subagent} to response you result:\n<expected-result>\n%s\n</expected-result>",
+          messages[i].content,
+          result_spec
+        )
         break
       end
     end
@@ -350,9 +473,12 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
 
   if not ok then
     log:error("Failed to create subagent chat: %s", subagent_chat)
-    -- Restore parent chat UI on error
+    -- Restore parent chat UI on error (blocking mode hid it; async mode only
+    -- if the chat is idle, otherwise we would interrupt the main agent)
     if parent_chat and parent_chat.ui then
-      parent_chat.ui:open()
+      if not subagent_config.async or chat_is_idle(parent_chat) then
+        parent_chat.ui:open()
+      end
     end
     if state.completion_callback then
       state.completion_callback("Error: Failed to create subagent chat", true)
@@ -369,6 +495,17 @@ function M:start_subagent(parent_chat, subagent_config, task, context)
 
   -- Store subagent_id on subagent chat for complete_tool identification
   subagent_chat._subagent_id = subagent_id
+
+  -- Register the completion callback: in async delivery mode the result is
+  -- queued and delivered on the parent chat's next idle point. In blocking
+  -- mode tool.lua installs its own output_cb-based callback after start.
+  if subagent_config.async then
+    state.completion_callback = function(result, is_error)
+      request_delivery(parent_chat, subagent_id, subagent_config.name, result, is_error)
+    end
+  else
+    state.completion_callback = nil
+  end
 
   -- Apply approval mode
   local approval_mode = subagent_config.approval_mode or "isolated"
@@ -453,9 +590,13 @@ function M:complete_subagent(parent_chat, subagent_id, result, is_error)
   end
   state.subagent_chat = nil
 
-  -- Restore parent chat UI
+  -- Restore parent chat UI (blocking mode hid it; async mode only when the
+  -- chat is idle and no other subagents are still running)
   if parent_chat and parent_chat.ui then
-    parent_chat.ui:open()
+    local async = state.config and state.config.async == true
+    if not async or (chat_is_idle(parent_chat) and not self:is_active(parent_chat)) then
+      parent_chat.ui:open()
+    end
   end
 
   -- Call completion callback if set
