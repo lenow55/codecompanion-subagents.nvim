@@ -154,6 +154,50 @@ T["async_delivery"]["delivery"]["result queued (not delivered) when parent is bu
   h.eq(0, child.lua_get([[_G.msg_count]]), "result must be queued, not delivered yet")
 end
 
+T["async_delivery"]["delivery"]["delivery autocmd is removed when the parent buffer is deleted"] = function()
+  child.lua([[
+    local api = vim.api
+    local before = #api.nvim_get_autocmds({ event = "User", pattern = "CodeCompanionChatDone" })
+
+    local manager = require("codecompanion._extensions.subagents.manager")
+    local parent = _G.make_async_parent()
+    parent.current_request = {} -- busy: completion queues and the listener must be armed
+    local bufnr = parent.bufnr
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("leak_agent", {
+      description = "leak", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    local id, st = next(parent._subagents)
+    st.subagent_chat = { bufnr = 9000, ui = { hide = function() end } }
+
+    manager:complete_subagent(parent, id, "LEAK-BODY", false)
+
+    -- The listener must be registered now
+    local after_start = #api.nvim_get_autocmds({ event = "User", pattern = "CodeCompanionChatDone" })
+    _G.listener_armed = after_start > before
+
+    -- Parent buffer dies -> listener must be cleaned up
+    api.nvim_buf_delete(bufnr, { force = true })
+    vim.wait(500) -- allow vim.schedule cleanup to run
+
+    local after_delete = #api.nvim_get_autocmds({ event = "User", pattern = "CodeCompanionChatDone" })
+    _G.listener_removed = after_delete == before
+    _G.delta = after_delete - before
+  ]])
+  h.eq(
+    true,
+    child.lua_get([[_G.listener_armed]]),
+    "the delivery listener must be registered on first async completion"
+  )
+  h.eq(
+    true,
+    child.lua_get([[_G.listener_removed]]),
+    "the delivery listener must be removed when the parent buffer dies"
+  )
+end
+
 T["async_delivery"]["delivery"]["parent buffer gone drops the result cleanly"] = function()
   child.lua([[
     local api = vim.api

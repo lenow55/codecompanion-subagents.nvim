@@ -102,30 +102,45 @@ local function request_delivery(chat, subagent_id, name, result, is_error)
 
   -- Deliver on the parent chat's next idle point. The event fires when a chat
   -- turn finishes and the buffer is ready for input, which is the only safe
-  -- moment to inject a message and (re)submit the chat.
-  if not chat._subagents_delivery_listened then
-    chat._subagents_delivery_listened = true
-    api.nvim_create_autocmd("User", {
-      pattern = "CodeCompanionChatDone",
-      callback = function(ev)
-        if not ev.data or ev.data.bufnr ~= chat.bufnr then
+  -- moment to inject a message and (re)submit the chat. The listener lives in
+  -- a per-chat augroup that deletes itself when the buffer dies, so no
+  -- global autocmd leaks for closed chats.
+  -- Note: nvim_buf_delete fires BufWipeout (not BufDelete, which only
+  -- :bdelete raises), so the self-cleanup listens for BufWipeout.
+  local aug =
+    api.nvim_create_augroup("CodeCompanionSubAgentsDelivery:" .. chat.bufnr, { clear = true })
+  api.nvim_create_autocmd("BufWipeout", {
+    group = aug,
+    buffer = chat.bufnr,
+    callback = function()
+      -- Parent chat is gone: drop queued results and the delivery listener
+      pending_results[chat.id] = nil
+      vim.schedule(function()
+        pcall(api.nvim_del_augroup_by_id, aug)
+      end)
+    end,
+  })
+  api.nvim_create_autocmd("User", {
+    group = aug,
+    pattern = "CodeCompanionChatDone",
+    callback = function(ev)
+      if not ev.data or ev.data.bufnr ~= chat.bufnr then
+        return
+      end
+      vim.schedule(function()
+        if not api.nvim_buf_is_valid(chat.bufnr) then
           return
         end
-        vim.schedule(function()
-          if not api.nvim_buf_is_valid(chat.bufnr) then
-            return
-          end
-          -- Make sure the chat object is still the registered one for this buffer
-          local Chat = require("codecompanion.interactions.chat")
-          local current = Chat.buf_get_chat(chat.bufnr)
-          if current ~= chat then
-            return
-          end
-          deliver_next(current)
-        end)
-      end,
-    })
-  end
+        -- Make sure the chat object is still the registered one for this buffer
+        local Chat = require("codecompanion.interactions.chat")
+        local current = Chat.buf_get_chat(chat.bufnr)
+        if current ~= chat then
+          return
+        end
+        deliver_next(current)
+      end)
+    end,
+  })
 
   if chat_is_idle(chat) then
     -- No LLM turn and no pending tool batch: deliver right away
