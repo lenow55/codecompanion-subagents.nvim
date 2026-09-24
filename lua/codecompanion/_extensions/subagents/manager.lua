@@ -10,8 +10,10 @@ M._powers = {}
 
 local api = vim.api
 
--- Results awaiting delivery in async_delivery mode.
--- [parent_chat_id] = { { subagent_id = string, name = string, result = string, is_error = boolean|nil }, ... }
+---Results awaiting delivery in async_delivery mode.
+-- [parent_chat] = { { subagent_id = string, name = string, result = string, is_error = boolean|nil }, ... }
+-- Keyed by the chat object itself: core chat ids are random small integers
+-- (collision-prone) and the chat table is unique for the life of the buffer.
 local pending_results = {}
 
 local Approvals = require("codecompanion.interactions.chat.tools.approvals")
@@ -53,23 +55,27 @@ local function deliver_next(chat)
   if not chat_is_idle(chat) then
     return
   end
-  local queue = pending_results[chat.id]
+  local queue = pending_results[chat]
   local item = queue and queue[1] or nil
   if not item then
     return
   end
   table.remove(queue, 1)
   if not next(queue) then
-    pending_results[chat.id] = nil
+    pending_results[chat] = nil
   end
 
+  local tag = string.format("[subagent_result id=%s]", item.subagent_id)
+  if item.is_error then
+    tag = tag .. " [ERROR]"
+  end
   chat:add_buf_message({
     role = config.constants.USER_ROLE,
-    content = string.format("[subagent_result id=%s]", item.subagent_id),
+    content = tag,
   })
   chat:add_message({
     role = config.constants.USER_ROLE,
-    content = string.format("[subagent_result id=%s]\n%s", item.subagent_id, item.result),
+    content = string.format("%s\n%s", tag, item.result),
   })
   chat:submit({ auto_submit = true })
 
@@ -88,10 +94,10 @@ local function request_delivery(chat, subagent_id, name, result, is_error)
     return
   end
 
-  local queue = pending_results[chat.id]
+  local queue = pending_results[chat]
   if not queue then
     queue = {}
-    pending_results[chat.id] = queue
+    pending_results[chat] = queue
   end
   table.insert(queue, {
     subagent_id = subagent_id,
@@ -114,7 +120,7 @@ local function request_delivery(chat, subagent_id, name, result, is_error)
     buffer = chat.bufnr,
     callback = function()
       -- Parent chat is gone: drop queued results and the delivery listener
-      pending_results[chat.id] = nil
+      pending_results[chat] = nil
       vim.schedule(function()
         pcall(api.nvim_del_augroup_by_id, aug)
       end)

@@ -100,6 +100,75 @@ T["async_delivery"]["dispatch"]["blocking tool does NOT call output_cb immediate
   h.eq(false, child.lua_get([[_G.called_now]]), "blocking mode must not fire output_cb on dispatch")
 end
 
+T["async_delivery"]["dispatch"]["async dispatch does not hide the parent chat UI"] = function()
+  child.lua([[
+    local api = vim.api
+    local bufnr = api.nvim_create_buf(false, true)
+    local parent = _G.make_async_parent()
+    local hides, opens = 0, 0
+    parent.ui = {
+      hide = function() hides = hides + 1 end,
+      open = function() opens = opens + 1 end,
+    }
+    parent.bufnr = bufnr
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("ui_agent", {
+      description = "ui", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+
+    _G.hides = hides
+    _G.opens = opens
+  ]])
+  h.eq(0, child.lua_get([[_G.hides]]), "async dispatch must not hide the parent chat UI")
+  h.eq(0, child.lua_get([[_G.opens]]), "async dispatch must not open the parent chat UI either")
+end
+
+T["async_delivery"]["dispatch"]["blocking dispatch hides the parent chat UI"] = function()
+  child.lua([[
+    local parent = _G.make_async_parent()
+    local hides = 0
+    parent.ui = { hide = function() hides = hides + 1 end, open = function() end }
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("ui_blk_agent", {
+      description = "ui blk", system_prompt = "p", tools = {},
+    }, { async_delivery = false })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+
+    _G.hides = hides
+  ]])
+  h.eq(1, child.lua_get([[_G.hides]]), "blocking dispatch must hide the parent chat UI")
+end
+
+T["async_delivery"]["dispatch"]["async completion does not open the parent chat UI while it is busy"] = function()
+  child.lua([[
+    local manager = require("codecompanion._extensions.subagents.manager")
+    local parent = _G.make_async_parent()
+    parent.current_request = {} -- busy: open must be suppressed
+    local opens = 0
+    parent.ui = { hide = function() end, open = function() opens = opens + 1 end }
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("ui_done_agent", {
+      description = "ui done", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    local id, st = next(parent._subagents)
+    st.subagent_chat = { bufnr = 9000, ui = { hide = function() end } }
+
+    manager:complete_subagent(parent, id, "DONE", false)
+
+    _G.opens = opens
+  ]])
+  h.eq(
+    0,
+    child.lua_get([[_G.opens]]),
+    "async completion must not open the parent chat UI while it is busy"
+  )
+end
+
 T["async_delivery"]["delivery"] = new_set()
 
 T["async_delivery"]["delivery"]["result delivered immediately when parent is idle"] = function()
@@ -152,6 +221,71 @@ T["async_delivery"]["delivery"]["result queued (not delivered) when parent is bu
   ]])
   h.eq(0, child.lua_get([[_G.submitted]]), "busy parent must not be submitted immediately")
   h.eq(0, child.lua_get([[_G.msg_count]]), "result must be queued, not delivered yet")
+end
+
+T["async_delivery"]["delivery"]["error result is delivered with an ERROR marker"] = function()
+  child.lua([[
+    local manager = require("codecompanion._extensions.subagents.manager")
+    local parent = _G.make_async_parent()
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("err_agent", {
+      description = "err", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    local id, st = next(parent._subagents)
+    st.subagent_chat = { bufnr = 9000, ui = { hide = function() end } }
+
+    manager:complete_subagent(parent, id, "SOMETHING WENT WRONG", true)
+
+    _G.msg0 = parent.messages[1] and parent.messages[1].content
+    _G.buf0 = parent.buf_messages[1] and parent.buf_messages[1].content
+  ]])
+  h.eq(
+    true,
+    child.lua_get([[_G.msg0 and _G.msg0:find("[subagent_result id=", 1, true) ~= nil]]),
+    "error delivery must carry the result tag"
+  )
+  h.eq(
+    true,
+    child.lua_get([[_G.msg0 and _G.msg0:find("[ERROR]", 1, true) ~= nil]]),
+    "error delivery must be marked [ERROR]"
+  )
+  h.eq(
+    true,
+    child.lua_get([[_G.msg0 and _G.msg0:find("SOMETHING WENT WRONG", 1, true) ~= nil]]),
+    "error delivery must contain the error text"
+  )
+  h.eq(
+    true,
+    child.lua_get([[_G.buf0 and _G.buf0:find("[ERROR]", 1, true) ~= nil]]),
+    "buffer line must be marked [ERROR] too"
+  )
+end
+
+T["async_delivery"]["delivery"]["success result is delivered without an ERROR marker"] = function()
+  child.lua([[
+    local manager = require("codecompanion._extensions.subagents.manager")
+    local parent = _G.make_async_parent()
+
+    local tool = require("codecompanion._extensions.subagents.tool")
+    local t = tool.create_subagent_tool("ok_agent", {
+      description = "ok", system_prompt = "p", tools = {},
+    }, { async_delivery = true })
+    t.cmds[1]({ chat = parent }, { task = "task" }, { output_cb = function() end })
+    local id, st = next(parent._subagents)
+    st.subagent_chat = { bufnr = 9000, ui = { hide = function() end } }
+
+    manager:complete_subagent(parent, id, "FINE-RESULT", false)
+
+    _G.msg0 = parent.messages[1] and parent.messages[1].content
+  ]])
+  h.eq(true, child.lua_get([[_G.msg0 and _G.msg0:find("FINE-RESULT", 1, true) ~= nil]]))
+  h.eq(
+    true,
+    child.lua_get([[_G.msg0:find("[ERROR]", 1, true) == nil]]),
+    "a successful delivery must not carry the ERROR marker"
+  )
 end
 
 T["async_delivery"]["delivery"]["delivery autocmd is removed when the parent buffer is deleted"] = function()

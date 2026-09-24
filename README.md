@@ -255,6 +255,7 @@ booleans. When both are set, the per-subagent value wins.
 **Trade-offs:**
 
 - The result arrives as a separate message, not as the tool result of the original call.
+- Failed subagents are delivered with an extra `[ERROR]` marker in the `[subagent_result id=...]` tag.
 - Every delivered result starts one extra LLM turn.
 - Several pending results are delivered one per idle turn, in FIFO order.
 
