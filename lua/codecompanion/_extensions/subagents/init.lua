@@ -60,10 +60,7 @@ end
 ---@param opts table
 ---@return nil
 local function validate_async_delivery(opts)
-  if opts.async_delivery == nil then
-    return
-  end
-  if type(opts.async_delivery) ~= "boolean" then
+  if opts.async_delivery ~= nil and type(opts.async_delivery) ~= "boolean" then
     error("async_delivery must be a boolean")
   end
   -- Per-subagent override must be a boolean too
